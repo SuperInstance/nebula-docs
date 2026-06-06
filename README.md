@@ -1,121 +1,61 @@
-# Nebula Usage Guide — Fleet Murmur Worker
+# Nebula — Edge Reflex Engine
 
-> Edge-deployed LLM-powered reflex engine on Cloudflare Workers.
-> URL: https://fleet-murmur-worker.casey-digennaro.workers.dev
+> The conversation *is* the building. Intent and execution blur.
 
-## Architecture
+## Current State
+
+Nebula is a Cloudflare Workers-deployed agent at the edge:
+- **LLM slow path** via DeepInfra (DeepSeek V4 Flash) — explains, reasons, stores reflexes
+- **Fast path** — known intents resolve in ~700ms from KV cache
+- **Similar path** — LLM confirms and adapts in ~800ms
+- **Embeddings** via BGE base (384-dim) on DeepInfra
+- **Secrets**: DEEPINFRA_API_KEY, GITHUB_TOKEN, EMBEDDING_SERVICE, BLACKBOARD_REPO
+
+## The Pipeline
 
 ```
-                    ┌─────────────────────┐
-                    │    Incoming Intent   │
-                    └────────┬────────────┘
-                             │
-                    ┌────────▼────────┐
-                    │   Embed (BGE)   │
-                    │  DeepInfra 384d │
-                    └────────┬────────┘
-                             │
-                    ┌────────▼────────┐
-                    │  Vector Search   │
-                    │  (KV-backed)     │
-                    └────────┬────────┘
-                             │
-              ┌──────────────┼──────────────┐
-              │              │              │
-     ┌────────▼───┐ ┌───────▼──────┐ ┌─────▼─────┐
-     │ ≥0.80      │ │ 0.55-0.80   │ │ <0.55     │
-     │ Fast Path  │ │ Similar Path│ │ Slow Path │
-     │ Return     │ │LLM Confirm  │ │DeepSeek V4│
-     │ stored     │ │ + Adapt     │ │Full Reason│
-     │ action     │ │             │ │ + Store   │
-     └────────────┘ └──────────────┘ └───────────┘
+Human: "I want a crate that does X"
+    │
+    ▼
+Nebula: teaches reflex, spawns sub-agent
+    │
+    ▼
+Sub-agent: creates crate via Claude Code
+    │
+    ▼
+GitHub: repo created, CI runs tests
+    │
+    ▼
+Nebula: reports "Done. Here's what exists."
 ```
 
-## Endpoints
+The gap between saying what you want and getting it is:
+- **Intent → Action**: ~700ms (fast path reflex)
+- **Intent → Built Crate**: ~2-5 minutes (sub-agent + Claude Code)
+- **Intent → Shipped**: ~5-10 minutes (+ CI + docs)
 
-### Health Check
-```bash
-curl https://fleet-murmur-worker.casey-digennaro.workers.dev/api/health
-```
-Returns: `{"status":"healthy","agent":"nebula","llm":{"configured":true,"provider":"deepinfra"},"vectorDb":{"backend":"kv-fallback","reflexCount":N}}`
+This is the baseline. The goal is to push it down to:
+- **Intent → Shipped**: < 60 seconds for simple cases
 
-### Teach a Reflex
-```bash
-curl -X POST https://fleet-murmur-worker.casey-digennaro.workers.dev/api/agent/teach \
-  -H "Content-Type: application/json" \
-  -d '{"intent":"what is the fleet disk status","action":"18G free on Oracle2, 19G free after GC"}'
-```
+## Integration Points
 
-### Query (uses fast/similar/slow path automatically)
-```bash
-curl -X POST https://fleet-murmur-worker.casey-digennaro.workers.dev/api/agent/message \
-  -H "Content-Type: application/json" \
-  -d '{"intent":"check fleet disk status"}'
-```
+| System | Role | Status |
+|--------|------|--------|
+| **Nebula** (Cloudflare Workers) | Intent parser + reflex engine | ✅ Live |
+| **Cloudflare KV** | Reflex storage + caching | ✅ Live |
+| **Cloudflare DO** | Agent coordination | ✅ Registered |
+| **GitHub (SuperInstance)** | Repo creation + CI/CD | ✅ Live |
+| **Notion** | Dashboard + activity log | ⚡ Wiring |
+| **Codespaces** | x86_64 compute on demand | ✅ Proven |
+| **I2I vessel** | Agent-to-agent protocol | ✅ Active |
 
-### List All Reflexes
-```bash
-curl https://fleet-murmur-worker.casey-digennaro.workers.dev/api/agent/reflexes
-```
+## How to Make Building Frictionless
 
-## Performance
+The key insight: **don't make the human leave the conversation.**
 
-| Path | Confidence | Latency | LLM Call |
-|------|-----------|---------|----------|
-| Fast | ≥0.80 | ~709ms | No (cached action) |
-| Similar | 0.55-0.80 | ~806ms | Yes (confirmation) |
-| Slow | <0.55 | ~2.45s | Yes (full reasoning) |
+1. Teach nebula a reflex → nebula handles the rest
+2. Nebula spawns sub-agents → they do the heavy lifting
+3. Results flow back into the conversation
+4. The reflex library grows → future requests the same intent are instant
 
-## Configured Secrets
-
-| Secret | Value | Purpose |
-|--------|-------|---------|
-| DEEPINFRA_API_KEY | ✅ Set | LLM + embeddings API |
-| DEEPINFRA_API_URL | `https://api.deepinfra.com/v1/openai` | API endpoint |
-| EMBEDDING_SERVICE | `deepinfra` | BAAI/bge-base-en-v1.5 |
-| GITHUB_TOKEN | ✅ Set | Blackboard publishing |
-| VECTOR_DB_BACKEND | `kv-fallback` | KV-backed vector search |
-| AGENT_NAME | `fleet-murmur-worker` | Identity |
-
-## Cron Schedule
-
-| Interval | Action |
-|----------|--------|
-| `*/5 * * * *` | Broadcast health to blackboard |
-| `0 * * * *` | Broadcast detailed metrics |
-| `0 3 * * *` | Nightly sync and maintenance |
-
-## Blackboard Integration
-
-Nebula publishes status to the construct-coordination repo:
-- `notes/edge/fleet-murmur-worker/status.json` — health + metrics
-- `notes/edge/fleet-murmur-worker/reflexes.json` — reflex library
-
-## Examples
-
-### Fleet health reflex chain
-```bash
-# Teach a reflex
-curl -X POST .../api/agent/teach \
-  -d '{"intent":"fleet health","action":"All nodes operational. Oracle2: 27G/45G disk, 21G RAM. Nebula: edge healthy."}'
-
-# Query it — fast path (exact match)
-curl .../api/agent/message -d '{"intent":"fleet health"}'
-# → {path: "fast", response: "All nodes operational...", durationMs: 709}
-
-# Similar query — similar path
-curl .../api/agent/message -d '{"intent":"how is the fleet doing?"}'
-# → LLM confirms intent, returns adapted response ~806ms
-
-# Novel query — slow path
-curl .../api/agent/message -d '{"intent":"compare disk usage trends over the last week"}'
-# → Full LLM reasoning ~2.45s, stores as new reflex
-```
-
-### Automation pattern
-Nebula can be called from cron, CI/CD pipelines, or other agents:
-```bash
-# From a GitHub workflow
-FLEET_STATUS=$(curl -s .../api/agent/message -d '{"intent":"fleet health"}' | jq -r '.response')
-echo "Status: $FLEET_STATUS"
-```
+This is what we have. The next step is making it so tight that the human says "I want..." and the agent is already building before the sentence finishes.
